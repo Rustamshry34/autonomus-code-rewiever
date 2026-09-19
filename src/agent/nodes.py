@@ -8,6 +8,7 @@ from src.agent.state import AgentState, PRInfo, CodeFinding, TestResult
 from src.tools.github_tools import github_client
 from src.tools.code_analysis import code_analyzer
 from src.tools.sandbox_executor import sandbox_executor
+from src.llm.client import llm_client
 import structlog
 
 logger = structlog.get_logger()
@@ -334,6 +335,88 @@ async def run_tests_node(state: AgentState) -> dict[str, Any]:
 
 
 # ============================================================================
+# Node 4: Generate Review
+# ============================================================================
+
+async def generate_review_node(state: AgentState) -> dict[str, Any]:
+    """
+    Analiz sonuçlarını LLM ile yorumlar ve review comment oluşturur.
+    
+    Bu node, tüm analiz bulgularını, test sonuçlarını ve PR bilgilerini
+    LLM'e göndererek kapsamlı, yapılandırılmış bir review comment üretir.
+    
+    Input State:
+        - pr_info: PRInfo
+        - findings: list[CodeFinding]
+        - test_results: list[TestResult]
+        
+    Output State Updates:
+        - messages: list[dict] (LLM conversation history)
+        - current_step: "post_results"
+        - error: None (veya hata mesajı)
+        
+    Returns:
+        State güncellemeleri dictionary'si
+    """
+    logger.info("Starting generate_review_node")
+    
+    pr_info = state.get("pr_info")
+    findings = state.get("findings", [])
+    test_results = state.get("test_results", [])
+    
+    if not pr_info:
+        error_msg = "PR info not found. Cannot generate review."
+        logger.error(error_msg)
+        return {
+            "current_step": "error",
+            "error": error_msg
+        }
+    
+    try:
+        # 1. Prompt oluştur
+        prompt = _build_review_prompt(pr_info, findings, test_results)
+        
+        logger.info(
+            "Sending review request to LLM",
+            prompt_length=len(prompt),
+            findings_count=len(findings),
+            test_results_count=len(test_results)
+        )
+        
+        # 2. LLM'e gönder (reasoning-enabled)
+        result = llm_client.chat(
+            user_message=prompt,
+            preserve_reasoning=True
+        )
+        
+        review_content = result["content"]
+        
+        logger.info(
+            "Review generated successfully",
+            review_length=len(review_content)
+        )
+        
+        # 3. State'i güncelle
+        return {
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": review_content}
+            ],
+            "current_step": "post_results",
+            "error": None
+        }
+        
+    except Exception as e:
+        error_msg = f"Review generation failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        
+        return {
+            "current_step": "error",
+            "error": error_msg
+        }
+
+
+# ============================================================================
 # Helper Functions
 # ============================================================================
 
@@ -435,4 +518,110 @@ import pytest
 '''
     
     return test_code
+
+
+def _build_review_prompt(
+    pr_info: PRInfo,
+    findings: list[CodeFinding],
+    test_results: list[TestResult]
+) -> str:
+    """
+    LLM için kapsamlı review prompt'u oluşturur.
+    
+    Args:
+        pr_info: PR bilgileri
+        findings: Analiz bulguları
+        test_results: Test sonuçları
+        
+    Returns:
+        Prompt metni
+    """
+    prompt = f"""You are a Senior Code Reviewer with expertise in security, performance, and code quality. Analyze the following code review findings and generate a comprehensive, actionable review comment.
+
+## Pull Request Information
+- **PR #{pr_info.number}**: {pr_info.title}
+- **Author**: {pr_info.author}
+- **Files Changed**: {len(pr_info.files_changed)}
+- **Description**: {pr_info.body or "No description provided"}
+
+## Code Analysis Findings
+"""
+    
+    if not findings:
+        prompt += "\n✅ **No issues found!** The code looks clean and follows best practices.\n"
+    else:
+        # Severity'ye göre grupla
+        critical = [f for f in findings if f.severity == "critical"]
+        high = [f for f in findings if f.severity == "high"]
+        medium = [f for f in findings if f.severity == "medium"]
+        low = [f for f in findings if f.severity in ["low", "info"]]
+        
+        if critical:
+            prompt += "\n### 🚨 Critical Issues (Must Fix)\n"
+            for i, f in enumerate(critical, 1):
+                prompt += f"""
+**{i}. {f.category.upper()}** - {f.file_path}:{f.line_number}
+- Issue: {f.description}
+- Suggestion: {f.suggestion}
+"""
+        
+        if high:
+            prompt += "\n### ⚠️ High Priority Issues\n"
+            for i, f in enumerate(high, 1):
+                prompt += f"""
+**{i}. {f.category.upper()}** - {f.file_path}:{f.line_number}
+- Issue: {f.description}
+- Suggestion: {f.suggestion}
+"""
+        
+        if medium:
+            prompt += f"\n### 📝 Medium Priority Issues ({len(medium)} found)\n"
+            for i, f in enumerate(medium, 1):
+                prompt += f"- {f.file_path}:{f.line_number}: {f.description}\n"
+        
+        if low:
+            prompt += f"\n### ℹ️ Low Priority / Info ({len(low)} found)\n"
+            for i, f in enumerate(low, 1):
+                prompt += f"- {f.file_path}:{f.line_number}: {f.description}\n"
+    
+    prompt += "\n## Test Results\n"
+    
+    if not test_results:
+        prompt += "\nℹ️ **No tests were run** for this PR.\n"
+    else:
+        passed = len([t for t in test_results if t.passed])
+        failed = len([t for t in test_results if not t.passed])
+        
+        prompt += f"\n- **Total Tests**: {len(test_results)}\n"
+        prompt += f"- **Passed**: {passed} ✅\n"
+        prompt += f"- **Failed**: {failed} {'❌' if failed > 0 else '✅'}\n"
+        
+        if failed > 0:
+            prompt += "\n### Failed Tests:\n"
+            for test in test_results:
+                if not test.passed:
+                    prompt += f"- **{test.test_name}**: {test.error_message}\n"
+    
+    prompt += """
+## Your Task
+
+Generate a comprehensive code review comment in **Markdown format** suitable for GitHub. The comment should include:
+
+1. **📋 Summary**: Brief overview of the review (2-3 sentences)
+2. **🚨 Critical Issues**: Must-fix issues with clear explanations (if any)
+3. **⚠️ Recommendations**: Suggestions for improvement
+4. **🧪 Test Coverage**: Assessment of test results and coverage gaps
+5. **✅ Action Items**: Clear, actionable next steps for the developer
+
+**Guidelines:**
+- Be constructive and specific
+- Provide code examples where helpful
+- Prioritize security and correctness
+- Acknowledge good practices when you see them
+- Format for GitHub (use headers, bullet points, code blocks)
+
+**Output only the Markdown comment, no additional explanations.**
+"""
+    
+    return prompt
 
