@@ -4,7 +4,7 @@ Her node, AgentState'i okur ve günceller.
 """
 
 from typing import Any
-from src.agent.state import AgentState, PRInfo, CodeFinding, TestResult
+from src.agent.state import AgentState, PRInfo, CodeFinding, TestResult, FixProposal
 from src.tools.github_tools import github_client
 from src.tools.code_analysis import code_analyzer
 from src.tools.sandbox_executor import sandbox_executor
@@ -624,4 +624,245 @@ Generate a comprehensive code review comment in **Markdown format** suitable for
 """
     
     return prompt
+
+# ============================================================================
+# Node 5: Generate Fix
+# ============================================================================
+
+async def generate_fix_node(state: AgentState) -> dict[str, Any]:
+    """
+    Başarısız testler ve kritik bulgular için düzeltme önerileri üretir.
+    
+    Bu node, LLM'i kullanarak düzeltme kodu üretir ve FixProposal'lar oluşturur.
+    
+    Input State:
+        - pr_info: PRInfo
+        - findings: list[CodeFinding]
+        - test_results: list[TestResult]
+        
+    Output State Updates:
+        - fix_proposals: list[FixProposal]
+        - current_step: "generate_review"
+        - error: None (veya hata mesajı)
+        
+    Returns:
+        State güncellemeleri dictionary'si
+    """
+    logger.info("Starting generate_fix_node")
+    
+    pr_info = state.get("pr_info")
+    findings = state.get("findings", [])
+    test_results = state.get("test_results", [])
+    
+    if not pr_info:
+        error_msg = "PR info not found. Cannot generate fixes."
+        logger.error(error_msg)
+        return {
+            "current_step": "error",
+            "error": error_msg
+        }
+    
+    try:
+        # 1. Düzeltme gerektiren sorunları belirle
+        critical_findings = [
+            f for f in findings 
+            if f.severity in ["critical", "high"]
+        ]
+        failed_tests = [
+            t for t in test_results 
+            if not t.passed
+        ]
+        
+        if not critical_findings and not failed_tests:
+            logger.info("No critical issues or failed tests, skipping fix generation")
+            return {
+                "fix_proposals": [],
+                "current_step": "generate_review",
+                "error": None
+            }
+        
+        logger.info(
+            "Generating fixes",
+            critical_findings_count=len(critical_findings),
+            failed_tests_count=len(failed_tests)
+        )
+        
+        # 2. Prompt oluştur
+        prompt = _build_fix_prompt(pr_info, critical_findings, failed_tests)
+        
+        # 3. LLM'e gönder
+        result = llm_client.chat(
+            user_message=prompt,
+            preserve_reasoning=True
+        )
+        
+        fix_response = result["content"]
+        
+        # 4. LLM cevabını parse et ve FixProposal'lara dönüştür
+        fix_proposals = _parse_fix_response(fix_response, critical_findings)
+        
+        logger.info(
+            "Fix proposals generated",
+            proposals_count=len(fix_proposals)
+        )
+        
+        # 5. State'i güncelle
+        return {
+            "fix_proposals": fix_proposals,
+            "current_step": "generate_review",
+            "error": None
+        }
+        
+    except Exception as e:
+        error_msg = f"Fix generation failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        
+        return {
+            "current_step": "error",
+            "error": error_msg
+        }
+
+
+def _build_fix_prompt(
+    pr_info: PRInfo,
+    critical_findings: list[CodeFinding],
+    failed_tests: list[TestResult]
+) -> str:
+    """
+    LLM için düzeltme prompt'u oluşturur.
+    
+    Args:
+        pr_info: PR bilgileri
+        critical_findings: Kritik bulgular
+        failed_tests: Başarısız testler
+        
+    Returns:
+        Prompt metni
+    """
+    prompt = f"""You are a Senior Software Engineer. Generate code fixes for the following critical issues and failed tests.
+
+## Context
+- PR #{pr_info.number}: {pr_info.title}
+- Files Changed: {', '.join(pr_info.files_changed)}
+
+## Critical Issues to Fix
+"""
+    
+    for i, finding in enumerate(critical_findings, 1):
+        prompt += f"""
+### Issue {i}: {finding.category.upper()}
+- File: {finding.file_path}:{finding.line_number}
+- Problem: {finding.description}
+- Suggestion: {finding.suggestion}
+"""
+    
+    if failed_tests:
+        prompt += "\n## Failed Tests\n"
+        for test in failed_tests:
+            prompt += f"""
+- Test: {test.test_name}
+- Error: {test.error_message}
+- Output: {test.output[:500] if test.output else "No output"}
+"""
+    
+    prompt += """
+## Your Task
+
+For each critical issue, provide a fix in the following format:
+
+FILE: <file_path>
+
+ORIGINAL:
+<original_code>
+
+FIXED:
+<fixed_code>
+
+EXPLANATION:
+<explanation_of_the_fix>
+
+CONFIDENCE: <0.0-1.0>
+
+
+**Guidelines:**
+- Provide complete, working code fixes
+- Follow Python best practices
+- Ensure fixes address the root cause
+- Include error handling where appropriate
+- Be specific and actionable
+
+**Output only the fixes in the specified format, no additional explanations.**
+"""
+    
+    return prompt
+
+
+def _parse_fix_response(
+    fix_response: str,
+    critical_findings: list[CodeFinding]
+) -> list[FixProposal]:
+    """
+    LLM cevabını parse eder ve FixProposal'lara dönüştürür.
+    
+    Args:
+        fix_response: LLM'in ürettiği düzeltme metni
+        critical_findings: Kritik bulgular (referans için)
+        
+    Returns:
+        FixProposal listesi
+    """
+    from src.agent.state import FixProposal
+    
+    proposals = []
+    
+    # Basit parse: "FILE:" bloklarını bul
+    blocks = fix_response.split("FILE:")[1:]  # İlk boş bloğu atla
+    
+    for block in blocks:
+        try:
+            # File path'i çıkar
+            lines = block.strip().split('\n')
+            file_path = lines[0].strip()
+            
+            # Bölümleri bul
+            original_start = block.find("ORIGINAL:")
+            fixed_start = block.find("FIXED:")
+            explanation_start = block.find("EXPLANATION:")
+            confidence_start = block.find("CONFIDENCE:")
+            
+            # Kod bloklarını çıkar
+            original_code = ""
+            if original_start != -1 and fixed_start != -1:
+                original_code = block[original_start + 9:fixed_start].strip()
+            
+            fixed_code = ""
+            if fixed_start != -1 and explanation_start != -1:
+                fixed_code = block[fixed_start + 6:explanation_start].strip()
+            
+            explanation = ""
+            if explanation_start != -1 and confidence_start != -1:
+                explanation = block[explanation_start + 12:confidence_start].strip()
+            
+            confidence = 0.5
+            if confidence_start != -1:
+                confidence_str = block[confidence_start + 11:].strip()
+                try:
+                    confidence = float(confidence_str)
+                except ValueError:
+                    confidence = 0.5
+            
+            proposals.append(FixProposal(
+                file_path=file_path,
+                original_code=original_code,
+                fixed_code=fixed_code,
+                explanation=explanation,
+                confidence=confidence
+            ))
+            
+        except Exception as e:
+            logger.warning(f"Failed to parse fix block: {e}")
+            continue
+    
+    return proposals
+
 
