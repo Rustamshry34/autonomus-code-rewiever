@@ -865,4 +865,123 @@ def _parse_fix_response(
     
     return proposals
 
+# ============================================================================
+# Node 6: Post Results
+# ============================================================================
+
+async def post_results_node(state: AgentState) -> dict[str, Any]:
+    """
+    Tüm sonuçları GitHub'a post eder.
+    
+    Bu node, review comment'i GitHub'a ekler ve gerekirse
+    düzeltme önerileri için yeni bir PR oluşturur.
+    
+    Input State:
+        - pr_info: PRInfo
+        - findings: list[CodeFinding]
+        - test_results: list[TestResult]
+        - fix_proposals: list[FixProposal]
+        - messages: list[dict] (LLM conversation)
+        
+    Output State Updates:
+        - current_step: "complete"
+        - error: None (veya hata mesajı)
+        
+    Returns:
+        State güncellemeleri dictionary'si
+    """
+    logger.info("Starting post_results_node")
+    
+    pr_info = state.get("pr_info")
+    fix_proposals = state.get("fix_proposals", [])
+    messages = state.get("messages", [])
+    
+    if not pr_info:
+        error_msg = "PR info not found. Cannot post results."
+        logger.error(error_msg)
+        return {
+            "current_step": "error",
+            "error": error_msg
+        }
+    
+    try:
+        # 1. Review comment'i al (messages'tan son assistant mesajı)
+        review_comment = None
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                review_comment = msg.get("content")
+                break
+        
+        if not review_comment:
+            logger.warning("No review comment found, generating default")
+            review_comment = "🤖 AI Code Review completed. No issues found."
+        
+        # 2. Review comment'i GitHub'a post et
+        logger.info(
+            "Posting review comment to GitHub",
+            pr_number=pr_info.number,
+            comment_length=len(review_comment)
+        )
+        
+        await github_client.add_pr_comment(
+            pr_number=pr_info.number,
+            body=review_comment
+        )
+        
+        logger.info("Review comment posted successfully")
+        
+        # 3. Düzeltme önerileri varsa, yeni bir PR oluştur
+        if fix_proposals:
+            logger.info(
+                "Creating fix PR",
+                proposals_count=len(fix_proposals)
+            )
+            
+            # Düzeltme dosyalarını hazırla
+            files_to_fix = {}
+            for proposal in fix_proposals:
+                if proposal.file_path and proposal.fixed_code:
+                    files_to_fix[proposal.file_path] = proposal.fixed_code
+            
+            if files_to_fix:
+                # PR açıklaması oluştur
+                fix_description = "\n".join([
+                    f"- **{p.file_path}**: {p.explanation}"
+                    for p in fix_proposals
+                ])
+                
+                # Yeni PR oluştur
+                fix_pr_title = f"🤖 AI: Automated fixes for PR #{pr_info.number}"
+                
+                await github_client.create_fix_pr(
+                    original_pr_number=pr_info.number,
+                    title=fix_pr_title,
+                    body=fix_description,
+                    files_to_fix=files_to_fix
+                )
+                
+                logger.info("Fix PR created successfully")
+        
+        # 4. Pipeline'ı tamamla
+        logger.info(
+            "Pipeline completed successfully",
+            pr_number=pr_info.number,
+            findings_count=len(state.get("findings", [])),
+            test_results_count=len(state.get("test_results", [])),
+            fix_proposals_count=len(fix_proposals)
+        )
+        
+        return {
+            "current_step": "complete",
+            "error": None
+        }
+        
+    except Exception as e:
+        error_msg = f"Failed to post results: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        
+        return {
+            "current_step": "error",
+            "error": error_msg
+        }
 
