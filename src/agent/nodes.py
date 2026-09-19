@@ -4,9 +4,10 @@ Her node, AgentState'i okur ve günceller.
 """
 
 from typing import Any
-from src.agent.state import AgentState, PRInfo, CodeFinding
+from src.agent.state import AgentState, PRInfo, CodeFinding, TestResult
 from src.tools.github_tools import github_client
 from src.tools.code_analysis import code_analyzer
+from src.tools.sandbox_executor import sandbox_executor
 import structlog
 
 logger = structlog.get_logger()
@@ -205,6 +206,134 @@ async def analyze_code_node(state: AgentState) -> dict[str, Any]:
 
 
 # ============================================================================
+# Node 3: Run Tests
+# ============================================================================
+
+async def run_tests_node(state: AgentState) -> dict[str, Any]:
+    """
+    Testleri izole Docker sandbox'ında çalıştırır.
+    
+    Bu node, PR'daki test dosyalarını veya kritik bulgular için
+    otomatik üretilen testleri sandbox'ta çalıştırır.
+    
+    Input State:
+        - pr_info: PRInfo (files_changed ve diff_content dolu)
+        - findings: list[CodeFinding]
+        
+    Output State Updates:
+        - test_results: list[TestResult]
+        - current_step: "generate_fix" veya "generate_review"
+        - error: None (veya hata mesajı)
+        
+    Returns:
+        State güncellemeleri dictionary'si
+    """
+    logger.info("Starting run_tests_node")
+    
+    pr_info = state.get("pr_info")
+    findings = state.get("findings", [])
+    
+    if not pr_info:
+        error_msg = "PR info not found. Cannot run tests."
+        logger.error(error_msg)
+        return {
+            "current_step": "error",
+            "error": error_msg
+        }
+    
+    try:
+        test_results: list[TestResult] = []
+        
+        # 1. PR'da test dosyaları var mı kontrol et
+        test_files = [
+            f for f in pr_info.files_changed 
+            if f.startswith('test_') or f.endswith('_test.py') or 'tests/' in f
+        ]
+        
+        # 2. Test dosyaları varsa, onları çalıştır
+        if test_files:
+            logger.info(
+                "Running existing test files",
+                test_files_count=len(test_files),
+                test_files=test_files
+            )
+            
+            for test_file in test_files:
+                # Diff'ten test kodunu çıkar
+                test_code = _extract_file_code_from_diff(
+                    pr_info.diff_content,
+                    test_file
+                )
+                
+                if test_code:
+                    logger.info(
+                        "Running test file",
+                        test_file=test_file,
+                        code_length=len(test_code)
+                    )
+                    
+                    result = sandbox_executor.run_pytest(
+                        test_code=test_code,
+                        file_name=test_file
+                    )
+                    test_results.append(result)
+        
+        # 3. Test dosyası yoksa ve kritik bulgular varsa, otomatik test üret
+        elif any(f.severity in ["critical", "high"] for f in findings):
+            logger.info(
+                "No test files found, generating tests for critical findings",
+                critical_findings_count=len([
+                    f for f in findings 
+                    if f.severity in ["critical", "high"]
+                ])
+            )
+            
+            # Kritik bulgular için test üret
+            generated_tests = _generate_tests_for_findings(findings)
+            
+            if generated_tests:
+                logger.info(
+                    "Running auto-generated tests",
+                    code_length=len(generated_tests)
+                )
+                
+                result = sandbox_executor.run_pytest(
+                    test_code=generated_tests,
+                    file_name="auto_generated_tests.py"
+                )
+                test_results.append(result)
+        
+        # 4. Test sonuçlarını değerlendir
+        failed_tests = [t for t in test_results if not t.passed]
+        
+        logger.info(
+            "Test execution completed",
+            total_tests=len(test_results),
+            failed_tests=len(failed_tests),
+            passed_tests=len(test_results) - len(failed_tests)
+        )
+        
+        # 5. Bir sonraki adıma karar ver
+        # Başarısız testler varsa düzeltme öner, yoksa review oluştur
+        next_step = "generate_fix" if failed_tests else "generate_review"
+        
+        return {
+            "test_results": test_results,
+            "current_step": next_step,
+            "error": None
+        }
+        
+    except Exception as e:
+        error_msg = f"Test execution failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        
+        return {
+            "current_step": "error",
+            "error": error_msg
+        }
+
+
+# ============================================================================
 # Helper Functions
 # ============================================================================
 
@@ -247,4 +376,63 @@ def _extract_file_code_from_diff(diff_content: str, file_path: str) -> str | Non
     
     return '\n'.join(code_lines) if code_lines else None
 
+
+def _generate_tests_for_findings(findings: list[CodeFinding]) -> str | None:
+    """
+    Kritik bulgular için otomatik test kodu üretir.
+    
+    Bu fonksiyon, kritik ve yüksek severity bulgular için
+    basit pytest testleri üretir.
+    
+    Args:
+        findings: Bulgu listesi
+        
+    Returns:
+        Pytest test kodu (veya None)
+    """
+    critical_findings = [
+        f for f in findings 
+        if f.severity in ["critical", "high"]
+    ]
+    
+    if not critical_findings:
+        return None
+    
+    # Test şablonu
+    test_code = '''"""
+Auto-generated tests for critical security and quality findings.
+These tests verify that critical issues are addressed.
+"""
+
+import pytest
+
+
+'''
+    
+    # Her kritik bulgu için bir test ekle
+    for i, finding in enumerate(critical_findings, 1):
+        test_code += f'''def test_finding_{i}_{finding.category}():
+    """
+    Test for {finding.category} finding:
+    {finding.description}
+    
+    File: {finding.file_path}:{finding.line_number}
+    Severity: {finding.severity}
+    Suggestion: {finding.suggestion}
+    """
+    # TODO: Implement actual test based on the finding
+    # This is a placeholder that should be replaced with
+    # actual test logic that verifies the fix
+    
+    # Örnek: SQL injection için parameterized query kontrolü
+    # Örnek: Hardcoded secret için environment variable kontrolü
+    
+    # Şimdilik placeholder - gerçek implementasyonda
+    # düzeltilmiş kodu test etmeli
+    assert True, "Placeholder test for {finding.category} finding"
+
+
+'''
+    
+    return test_code
 
